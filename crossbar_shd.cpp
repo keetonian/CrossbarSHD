@@ -1,14 +1,12 @@
 /* 
- * TODO:
- *  Change vector that stores the reference genome into a map of vectors, and store each chromosome separately
- *  Report the chromosome index and index into the chromosome instead of a global index number
- *  Change output reporting
+ * CrossbarSHD
+ * Software to simulate the CrossbarSHD algorithm
  *
- *  output: NAME    0/16    Chrom   Index   255   100M    *   0   0   Sequence .....
+ * output: Read_Name    0/16    Chromosome_name   Index_in_chromosome   Error_count
  * 
  * crossbar_shd.cpp
  * Author: Keeton Hodgson
- * 1/17/2017
+ * Last modified: 1/27/2017
  */
 
 #include <stdio.h>
