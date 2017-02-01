@@ -141,7 +141,6 @@ int main(int argc, char** argv)
                       threads = atoi(argv[i]+2);
                     else
                       threads = atoi(argv[i+1]);
-                    cout << threads << endl;
                   }
                   break;
         default: //unknown flag
