@@ -41,6 +41,8 @@ string compare16(vector<unsigned short>* ref, vector<unsigned short> read_in, ve
 string compare4(vector<unsigned char>* ref, vector<unsigned char> read_in, vector<unsigned char> inverse, int shift, int threshold, int* num_matches, string name, string chrom_name);
 
 //static int report_total_matches = 0;
+char* sequence = 0;
+int threads = 2;
 
 int main(int argc, char** argv)
 {
@@ -82,12 +84,14 @@ int main(int argc, char** argv)
                     cout << "This program compares a read sequence with a reference genome.\n";
                     cout << "\t-g: reference genome path\n";
                     cout << "\t-r: read sequence path\n";
-                    cout << "\t-h: display this help file\n";
+                    cout << "\t-h: display this information\n";
                     cout << "\t-t: tolerated error threshold\n";
                     cout << "\t\t0: only exact matches (no errors tolerated)\n";
                     cout << "\t-s: shift distance\n";
                     cout << "\t-4: use 4-bit encodings\n";
                     cout << "\t-16: use 16-bit encodings\n";
+                    cout << "\t-n: number of threads to use (default = 2)\n";
+                    cout << "\t-p: name of the read sequence to start from \n\t\t(default: none, start from beginning of file)\n";
                     //cout << "\t-m: turn on total match reporting\n";
                     //cout << "\t-o1: output grouped by sequence name\n";
                     //cout << "\t-o2: output grouped by chromosome name\n";
@@ -120,6 +124,24 @@ int main(int argc, char** argv)
                       shift = atoi(argv[i]+2);
                     else
                       shift = atoi(argv[i+1]);
+                  }
+                  break;
+        case 'p': // starting sequence
+                  {
+                    sequence = ParseFile(argv, i);
+                    if(sequence == 0) {
+                      cerr << "Error: specify a sequence after -p" << endl;
+                      return 1;
+                    }
+                  }
+                  break;
+        case 'n': // number threads
+                  {
+                    if(argv[i][2] != 0)
+                      threads = atoi(argv[i]+2);
+                    else
+                      threads = atoi(argv[i+1]);
+                    cout << threads << endl;
                   }
                   break;
         default: //unknown flag
@@ -190,7 +212,10 @@ void CompareRead16(char* read_file, char* reference_file, int shift, int thresho
   ref.reserve(64);
   ref_names.reserve(64);
   PrepareReference16(reference_file, &ref, &ref_names);
-  ctpl::thread_pool p(8);
+  ctpl::thread_pool p(threads);
+  string str;
+  if(sequence != 0)
+    str = string(sequence);
 
   // Set up and read from the file with the read sequences
   string read_line;
@@ -209,6 +234,13 @@ void CompareRead16(char* read_file, char* reference_file, int shift, int thresho
           c = read_line[cindex];
         }
         // s+='\t';
+        if(sequence != 0){
+          if(str == name)
+            sequence = 0;
+          else
+            continue;
+        }
+
 
         getline(file, read_line);
         for(unsigned int i = 0; i < ref.size(); i++){
@@ -362,8 +394,8 @@ void PrepareReference16(char* ref_file, vector<vector<unsigned short> * > * ref,
       }
       else {
         string name = "";
-        int j = 1;
-        while(line[j] != ' ' && line[j] != '\t'){
+        unsigned int j = 1;
+        while(line[j] != ' ' && line[j] != '\t' && j < line.size()){
           name+=line[j];
           j++;
         }
@@ -387,6 +419,8 @@ void PrepareReference16(char* ref_file, vector<vector<unsigned short> * > * ref,
  * Converts 2 characters to their 16-bit encodings
  * */
 unsigned short ConvertCharacters16(char char1, char char2) {
+  char1 = toupper(char1);
+  char2 = toupper(char2);
   if(char1 == 'A') {
     switch(char2) {
       case 'A': return 0x8000;
@@ -431,6 +465,8 @@ unsigned short ConvertCharacters16(char char1, char char2) {
  * Converts 2 characters to their 16-bit encodings
  * */
 unsigned short ConvertInverseCharacters16(char char1, char char2) {
+  char1 = toupper(char1);
+  char2 = toupper(char2);
   if(char1 == 'T') {
     switch(char2) {
       case 'T': return 0x8000;
@@ -518,6 +554,7 @@ unsigned char ConvertCharacters4(char char1, char char2) {
 }
 
 unsigned char ConvertCharacter4(char char1) {
+  char1 = toupper(char1);
   switch(char1) {
     case 'A': return 0x8;
     case 'T': return 0x4;
@@ -528,6 +565,7 @@ unsigned char ConvertCharacter4(char char1) {
 }
 
 unsigned char ConvertCharacterInverse4(char char1) {
+  char1 = toupper(char1);
   switch(char1) {
     case 'T': return 0x8;
     case 'A': return 0x4;
