@@ -1,11 +1,11 @@
 CXX = g++
-CFLAGS = -std=c++11 -O2 -Wall 
-THREAD = -pthread -lpthread 
+NVCC = nvcc -ccbin g++
+CFLAGS = -std=c++11 -O2 
 
 all: CrossbarSHD cxcompare
 
-CrossbarSHD: crossbar_shd.cpp ctpl.h compare.o reference.o commandline.o
-	$(CXX) $(CFLAGS) $(THREAD) -o CrossbarSHD crossbar_shd.cpp compare.o reference.o commandline.o ctpl.h
+CrossbarSHD: crossbar_shd.cu compare.o reference.o commandline.o
+	$(NVCC) $(CFLAGS) -o CrossbarSHD crossbar_shd.cu compare.o reference.o commandline.o 
 
 compare.o: compare.h compare.cpp
 	$(CXX) $(CFLAGS) -c compare.cpp 

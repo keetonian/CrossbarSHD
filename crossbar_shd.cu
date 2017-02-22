@@ -17,17 +17,14 @@
 #include <string>
 #include <sstream>
 #include "cuda_runtime.h"
-#include <helper_cuda.h>
 
 #include "compare.h"
 #include "reference.h"
 #include "commandline.h"
 
-#include "ctpl.h"
-
 using namespace std;
 
-void read_compare_func16(int id, string header, string read_line, string chrom_name, vector<unsigned short> * ref, int shift, int threshold);
+void read_compare_func16(string header, string read_line, string chrom_name, vector<unsigned short> * ref, int shift, int threshold);
 void read_compare_func4(int id, string header, string read_line, string chrom_name, vector<unsigned char> * ref, int shift, int threshold);
 
 void CompareRead16(char* read_file, char* reference_file, int shift, int threshold);
@@ -40,12 +37,14 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
  */
 __global__ void compare16(const unsigned short * ref, const unsigned short * read, char * output, int numElements) {
 
-  __shared__ char s[blockDim.x];
+  __shared__ int s[64];
 
   int i = blockDim.x * blockIdx.x + threadIdx.x;
 
   if(i < numElements && read[threadIdx.x]&ref[i])
     s[threadIdx.x] = 1;
+  else
+    s[threadIdx.x] = 0;
 
   __syncthreads();
 
@@ -66,7 +65,8 @@ __global__ void compare16(const unsigned short * ref, const unsigned short * rea
   __syncthreads();
 
   if(threadIdx.x == 0)
-    output[blockIdx.x] = s[threadIdx.x];
+    //output[blockIdx.x] = s[threadIdx.x];
+    output[blockIdx.x] = blockIdx.x;
 }
 
 char* sequence = 0;
@@ -172,14 +172,19 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
   // Save read sequence
   //header += read_line + '\n';
 
-  std::vector<unsigned short> readv_temp, readv, read_inverse_temp, read_inverse;
+  cout << "Converting string" << endl;
+  std::vector<unsigned short> readv_temp, read_inverse_temp;
+  unsigned short * readv, * read_inverse;
+  readv = (unsigned short *)malloc((read_line.size()-1)*sizeof(short));
+  read_inverse = (unsigned short *)malloc((read_line.size()-1)*sizeof(short));
   int read_size = read_line.size();
   for(; j < read_size-1; j++) {
     readv_temp.push_back(ConvertCharacters16(read_line[j], read_line[j+1]));
     read_inverse_temp.push_back(ConvertInverseCharacters16(read_line[read_size-(j+1)], read_line[read_size-(j+2)]));
   }
 
-  for(int i = 0; i < read_size; i++){
+  cout << "Doing shift" << endl;
+  for(int i = 0; i < readv_temp.size(); i++){
     unsigned short a = readv_temp.at(i);
     unsigned short b = read_inverse_temp.at(i);
     for(j = 0; j <= shift; j++){
@@ -187,18 +192,22 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
 	a = a | readv_temp.at(i-j);
 	b = b | read_inverse_temp.at(i-j);
       }
-      if((i+j)<read_size){
+      if((i+j)<readv_temp.size()){
 	a = a | readv_temp.at(i+j);
 	b = b | read_inverse_temp.at(i+j);
       }
     }
-    readv.push_back(a);
-    read_inverse.push_back(b);
+    readv[i] = a;
+    read_inverse[i] = b;
   }
-
+  
+  cout << "Starting cuda memory allocation" << endl;
 
   int numElements=ref->size();
   size_t size = numElements*sizeof(short);
+  size_t size_out = numElements*sizeof(char);
+  size_t size_read = (read_size-1)*sizeof(short);
+  char * hOutput = (char*)malloc(size_out);
 
   cudaError_t err = cudaSuccess;
   unsigned short *cRef = NULL;
@@ -209,40 +218,80 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
   }
 
   unsigned short *cRead = NULL;
-  err = cudaMalloc((void **) &cRead, read_size);
+  err = cudaMalloc((void **) &cRead, size_read);
   if(err != cudaSuccess) {
     cerr << "Cuda failure on cRead" << endl;
     exit(1);
   }
 
   char * cOutput = NULL;
-  err = cudaMalloc((void **) &cOutput, size);
+  err = cudaMalloc((void **) &cOutput, size_out);
   if(err != cudaSuccess) {
     cerr << "CudaFailure on cOutput" << endl;
     exit(1);
   }
 
-  err = cudaMemcpy(ref[0], cRef, size, cudaMemcpyHostToDevice);
+  err = cudaMemcpy(cRead, readv, size_read, cudaMemcpyHostToDevice);
+  if(err != cudaSuccess) {
+    cerr << "Cuda failure on copying cRead " << cudaGetErrorString(err) << endl;
+    exit(1);
+  }
+
+  cout << "Doing reference " << endl;
+
+  err = cudaMemcpy(cRef, (unsigned char *)(&(ref->at(0))), size, cudaMemcpyHostToDevice);
   if(err != cudaSuccess) {
     cerr << "Cuda Failure on copying cRef" << endl;
     exit(1);
   }
 
-  err = cudaMemcpy(&readv[0], cRead, read_size, cudaMemcpyHostToDevice);
-  if(err != cudaSuccess) {
-    cerr << "Cuda failure on copying cRead" << endl;
-    exit(1);
-  }
-
   int threadsPerBlock = 32;
-  int blocksPerGrid = (numElements + threadsPerBlock - 1) / threadsPerBlock;
+  int blocksPerGrid = (numElements-threadsPerBlock) / threadsPerBlock;
 
+  cout << "Starting cuda computation" << endl;
+
+  cout << numElements << endl;
+  cout << blocksPerGrid << endl;
+  blocksPerGrid = blocksPerGrid>>6;
   compare16<<<blocksPerGrid, threadsPerBlock>>>(cRef, cRead, cOutput, numElements);
   err = cudaGetLastError();
   if(err != cudaSuccess){
-    cout << "Failure on cuda computation" << endl;
+    cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
     exit(1);
   }
+
+  cout << "Starting cuda freeing memory" << endl;
+
+  err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
+  if(err != cudaSuccess){
+    cerr << "Failure on copying output" << endl;
+    exit(1);
+  }
+
+  err = cudaFree(cRef);
+  if(err != cudaSuccess) {
+    cerr << "Failure freeing reference" << endl;
+    exit(1);
+  }
+  err = cudaFree(cRead);
+  if(err != cudaSuccess) {
+    cerr << "Failure freeing read" << endl;
+    exit(1);
+  }
+  err = cudaFree(cOutput);
+  if(err != cudaSuccess) {
+    cerr << "Failure freeing output" << endl;
+    exit(1);
+  }
+
+  for(int ii = 0; ii < numElements; ii++)
+    if(hOutput[ii] >= 31)
+      cout << (int)hOutput[ii] << endl;
+
+  free(hOutput);
+  free(readv);
+  free(read_inverse);
+
 }
 
 /*
@@ -255,7 +304,7 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
   ref.reserve(64);
   ref_names.reserve(64);
   PrepareReference4(reference_file, &ref, &ref_names);
-  ctpl::thread_pool p(8);
+  //ctpl::thread_pool p(8);
 
   // Set up and read from the file with the read sequences
   string read_line;
@@ -277,7 +326,7 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
 
         getline(file, read_line);
         for(unsigned int i = 0; i < ref.size(); i++) {
-          p.push(read_compare_func4, s, read_line, ref_names.at(i), ref.at(i), shift, threshold);
+    //      p.push(read_compare_func4, s, read_line, ref_names.at(i), ref.at(i), shift, threshold);
         }
       }
     }
