@@ -17,6 +17,7 @@
 #include <string>
 #include <sstream>
 #include "cuda_runtime.h"
+#include "device_launch_parameters.h"
 
 #include "compare.h"
 #include "reference.h"
@@ -35,17 +36,20 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
  * ref: pointer to reference genome (large compared to read). Format: 16-bit 1-hot encodings.
  * read: pointer to read sequence. Again, 16-bit 1-hot encodings.
  */
-__global__ void compare16(const unsigned short * ref, const unsigned short * read, char * output, int numElements) {
+__global__ void compare16(const unsigned short * ref, const unsigned short * read, int * output, int numElements) {
 
-  __shared__ int s[64];
+  __shared__ int s[1024];
 
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
+  //int i = blockDim.x * blockIdx.x + threadIdx.x;
+  int i = threadIdx.x + (threadIdx.y<<5) + (blockIdx.x<<10);
+  int ii = threadIdx.x + (threadIdx.y<<5);
 
   if(i < numElements && read[threadIdx.x]&ref[i])
-    s[threadIdx.x] = 1;
+    s[ii] = 1;
   else
-    s[threadIdx.x] = 0;
-
+    s[ii] = 0;
+  output[i] = s[ii];//s[i];//(int)threadIdx.x+threadIdx.y*32;
+/*
   __syncthreads();
 
   if(threadIdx.x % 2 == 0 && threadIdx.x + 1 < blockDim.x)
@@ -63,10 +67,10 @@ __global__ void compare16(const unsigned short * ref, const unsigned short * rea
   if(threadIdx.x % 32 == 0 && threadIdx.x + 16 < blockDim.x)
     s[threadIdx.x] += s[threadIdx.x+16];
   __syncthreads();
-
-  if(threadIdx.x == 0)
-    //output[blockIdx.x] = s[threadIdx.x];
-    output[blockIdx.x] = blockIdx.x;
+*/
+  //if(threadIdx.x == 0)
+    //output[i] = s[threadIdx.x];
+    //output[i] = 1;
 }
 
 char* sequence = 0;
@@ -203,11 +207,14 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
   
   cout << "Starting cuda memory allocation" << endl;
 
-  int numElements=ref->size();
+  int blockD = 1024 << 10;
+
+  int numElements=blockD*32*32;//ref->size();
+  cout << "Number of Elements: " << numElements << " Total: " << ref->size() << endl;
   size_t size = numElements*sizeof(short);
-  size_t size_out = numElements*sizeof(char);
+  size_t size_out = numElements*sizeof(int);
   size_t size_read = (read_size-1)*sizeof(short);
-  char * hOutput = (char*)malloc(size_out);
+  int* hOutput = (int*)malloc(size_out);
 
   cudaError_t err = cudaSuccess;
   unsigned short *cRef = NULL;
@@ -224,7 +231,7 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
     exit(1);
   }
 
-  char * cOutput = NULL;
+  int* cOutput = NULL;
   err = cudaMalloc((void **) &cOutput, size_out);
   if(err != cudaSuccess) {
     cerr << "CudaFailure on cOutput" << endl;
@@ -239,21 +246,31 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
 
   cout << "Doing reference " << endl;
 
-  err = cudaMemcpy(cRef, (unsigned char *)(&(ref->at(0))), size, cudaMemcpyHostToDevice);
+  err = cudaMemcpy(cRef, (unsigned short*)(&(ref->at(0))), size, cudaMemcpyHostToDevice);
   if(err != cudaSuccess) {
     cerr << "Cuda Failure on copying cRef" << endl;
     exit(1);
   }
 
-  int threadsPerBlock = 32;
-  int blocksPerGrid = (numElements-threadsPerBlock) / threadsPerBlock;
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  unsigned int maxGridSizeX = prop.maxGridSize[0];
+
+  dim3 threadsPerBlock(32,32);
+  unsigned int y = 1;
+  unsigned int x = (int)ceil(numElements/(threadsPerBlock.x * threadsPerBlock.x));
+
+  while(x > maxGridSizeX){
+    x = x >> 1;
+    y = y << 1;
+  }
+  dim3 blocksPerGrid(x, y);
 
   cout << "Starting cuda computation" << endl;
 
   cout << numElements << endl;
-  cout << blocksPerGrid << endl;
-  blocksPerGrid = blocksPerGrid>>6;
-  compare16<<<blocksPerGrid, threadsPerBlock>>>(cRef, cRead, cOutput, numElements);
+  cout << blocksPerGrid.x << ","<<blocksPerGrid.y << endl;
+  compare16<<<blockD,threadsPerBlock>>>(cRef, cRead, cOutput, numElements);
   err = cudaGetLastError();
   if(err != cudaSuccess){
     cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
@@ -264,7 +281,7 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
 
   err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
   if(err != cudaSuccess){
-    cerr << "Failure on copying output" << endl;
+    cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
     exit(1);
   }
 
@@ -284,13 +301,17 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
     exit(1);
   }
 
-  for(int ii = 0; ii < numElements; ii++)
-    if(hOutput[ii] >= 31)
-      cout << (int)hOutput[ii] << endl;
+  cout << "Freed cuda memory" << endl;
+
+  //for(int ii = 0; ii < numElements; ii++)
+    //if(hOutput[ii] >= 31)
+      //cout << (int)hOutput[ii] << endl;
+
 
   free(hOutput);
   free(readv);
   free(read_inverse);
+  cout << "Completed function" << endl;
 
 }
 
