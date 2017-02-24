@@ -122,235 +122,231 @@ int main(int argc, char** argv)
  * 16 bit version
  */
 void CompareRead16(char* read_file, char* reference_file, int shift, int threshold) {
+
+  // Convert the reference to 16-bit vectors
   vector<vector<unsigned short> * > ref(0);
   vector<string> ref_names(0);
   ref.reserve(64);
   ref_names.reserve(64);
   PrepareReference16(reference_file, &ref, &ref_names);
-  //ctpl::thread_pool p(threads);
+
+
+  // Get the starting read if it exists.
   string str;
   if(sequence != 0)
     str = string(sequence);
 
-  // Set up and read from the file with the read sequences
-  string read_line;
-  ifstream file(read_file);
-  if(file.is_open()) {
+  // Do the comparisons one chromosome at a time to be more memory efficient
+  for(unsigned int chromosome = 0; chromosome < ref.size(); chromosome++){
 
-    // Step through the read sequences
-    while(getline(file, read_line)) {
-      if(read_line.size() > 2 && read_line[0] == '@' && read_line[1] == 'E' && read_line[2] == 'R') {
-	char c = read_line[1];
-	string name = "";
-	int cindex = 1;
-	while(c != ' ') {
-	  name+=c;
-	  cindex++;
-	  c = read_line[cindex];
-	}
-	// s+='\t';
-	if(sequence != 0){
-	  if(str == name)
-	    sequence = 0;
-	  else
-	    continue;
-	}
+    string chrom_name = ref_names.at(chromosome);
+
+    // Prepare sizes of elements
+    int numElements=ref.at(chromosome)->size();
+    size_t size = numElements*sizeof(short);
+    size_t size_out = numElements*sizeof(char);
+    char* hOutput = (char*)malloc(size_out);
 
 
-	getline(file, read_line);
-	for(unsigned int i = 0; i < ref.size(); i++){
-	  //p.push(read_compare_func16, name, read_line, ref_names.at(i), ref.at(i), shift, threshold);
-	  read_compare_func16(name, read_line, ref_names.at(i), ref.at(i), shift, threshold, seed_size);
+    // Reserve space for the Reference, Output arrays in the GPU
+    cudaError_t err = cudaSuccess;
+    unsigned short *cRef = NULL;
+    err = cudaMalloc((void **) &cRef, size);
+    if(err != cudaSuccess){
+      cerr << "Failed to allocate device vector ref (error code " << cudaGetErrorString(err) << ")!" << endl;
+      exit(1);
+    }
+
+    char* cOutput = NULL;
+    err = cudaMalloc((void **) &cOutput, size_out);
+    if(err != cudaSuccess) {
+      cerr << "CudaFailure on cOutput" << cudaGetErrorString(err) << endl;
+      exit(1);
+    }
+
+    // Copy the reference chromosome into the GPU
+    err = cudaMemcpy(cRef, (unsigned short*)(&(ref.at(chromosome)->at(0))), size, cudaMemcpyHostToDevice);
+    if(err != cudaSuccess) {
+      cerr << "Cuda Failure on copying cRef" << endl;
+      exit(1);
+    }
+
+    // Prepare the thread dimensions
+    dim3 threadsPerBlock(seed_size, seed_size);
+    int blocksPerGrid= (numElements + seed_size)/(seed_size);
+
+    // Extract the reads (name and sequence) from the read file
+    string read_line;
+    ifstream file(read_file);
+    if(file.is_open()) {
+
+      // Step through the read sequences
+      while(getline(file, read_line)) {
+	
+	// Extract the name
+	if(read_line.size() > 2 && read_line[0] == '@' && read_line[1] == 'E' && read_line[2] == 'R') {
+	  char c = read_line[1];
+	  string name = "";
+	  int cindex = 1;
+	  while(c != ' ') {
+	    name+=c;
+	    cindex++;
+	    c = read_line[cindex];
+	  }
+	  // s+='\t';
+	  if(sequence != 0){
+	    if(str == name)
+	      sequence = 0;
+	    else
+	      continue;
+	  }
+
+	  // Get the sequence
+	  getline(file, read_line);
+
+	  // Prepare the sequences to be used by the GPU
+	  int read_size = read_line.size()-1;
+	  vector<unsigned short> readv_temp, read_inverse_temp;
+
+	  // Allocate space for the arrays
+	  unsigned short * readv, * read_inverse;
+	  readv = (unsigned short *)malloc((read_size)*sizeof(short));
+	  read_inverse = (unsigned short *)malloc((read_size)*sizeof(short));
+	  size_t size_read = (read_size)*sizeof(short);
+	  for(int j = 0; j < read_size; j++) {
+	    readv_temp.push_back(ConvertCharacters16(read_line[j], read_line[j+1]));
+	    read_inverse_temp.push_back(ConvertInverseCharacters16(read_line[read_size-(j)], read_line[read_size-(j+1)]));
+	  }
+
+	  // Copy the data into the arrays, using appropriate shift distance
+	  for(int i = 0; i < readv_temp.size(); i++){
+	    unsigned short a = readv_temp.at(i);
+	    unsigned short b = read_inverse_temp.at(i);
+	    for(int j = 0; j <= shift; j++){
+	      if(i>=j){
+		a = a | readv_temp.at(i-j);
+		b = b | read_inverse_temp.at(i-j);
+	      }
+	      if((i+j)<readv_temp.size()){
+		a = a | readv_temp.at(i+j);
+		b = b | read_inverse_temp.at(i+j);
+	      }
+	    }
+	    readv[i] = a;
+	    read_inverse[i] = b;
+	  }
+
+	  // Allocate space on GPU for the forward/reverse inverse reads
+	  unsigned short *cRead = NULL;
+	  err = cudaMalloc((void **) &cRead, size_read);
+	  if(err != cudaSuccess) {
+	    cerr << "Cuda failure on cRead" << endl;
+	    exit(1);
+	  }
+
+	  unsigned short *cInverse = NULL;
+	  err = cudaMalloc((void **) &cInverse, size_read);
+	  if(err != cudaSuccess) {
+	    cerr << "Cuda failure on cInverse" << endl;
+	    exit(1);
+	  }
+
+	  err = cudaMemcpy(cRead, readv, size_read, cudaMemcpyHostToDevice);
+	  if(err != cudaSuccess) {
+	    cerr << "Cuda failure on copying cRead " << cudaGetErrorString(err) << endl;
+	    exit(1);
+	  }
+
+	  err = cudaMemcpy(cInverse, read_inverse, size_read, cudaMemcpyHostToDevice);
+	  if(err != cudaSuccess) {
+	    cerr << "Cuda failure on copying cInverse " << cudaGetErrorString(err) << endl;
+	    exit(1);
+	  }
+
+	  // Do the calculations for each seed
+	  for(int i = 0; i < (read_size)/seed_size; i++){
+
+	    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cRead, cOutput, numElements, i*seed_size);
+	    err = cudaGetLastError();
+	    if(err != cudaSuccess){
+	      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
+	      exit(1);
+	    }
+
+	    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
+	    if(err != cudaSuccess){
+	      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
+	      exit(1);
+	    }
+
+	    // Print the results
+	    for(int ii = 0; ii < numElements; ii++)
+	      if(hOutput[ii] >= seed_size-threshold)
+		cout << name << '\t' << seed_size << '\t' << i << '\t' << "0" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
+
+	  }
+
+	  // Do the calculations for each rinverse seed
+	  for(int i = 0; i < (read_size)/seed_size; i++){
+
+	    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cInverse, cOutput, numElements, i*seed_size);
+	    err = cudaGetLastError();
+	    if(err != cudaSuccess){
+	      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
+	      exit(1);
+	    }
+
+	    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
+	    if(err != cudaSuccess){
+	      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
+	      exit(1);
+	    }
+
+	    // Print the results
+	    for(int ii = 0; ii < numElements; ii++)
+	      if(hOutput[ii] >= seed_size-threshold)
+		cout << name << '\t' << seed_size << '\t' << i << '\t' << "16" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
+	  }
+
+	  err = cudaFree(cRead);
+	  if(err != cudaSuccess) {
+	    cerr << "Failure freeing read" << endl;
+	    exit(1);
+	  }
+	  err = cudaFree(cInverse);
+	  if(err != cudaSuccess) {
+	    cerr << "failure freeing cinverse" << endl;
+	    exit(1);
+	  }
+	  free(readv);
+	  free(read_inverse);
+
 	}
       }
     }
-  }
-  else {
-    cerr << "Unable to open reference file \n";
-    exit(1);
+    else {
+      cerr << "Unable to open reference file \n";
+      exit(1);
+    }
+
+    cout << "HERE" << endl;
+
+    // Free all GPU memory
+    err = cudaFree(cRef);
+    if(err != cudaSuccess) {
+      cerr << "Failure freeing reference" << endl;
+      exit(1);
+    }
+
+    err = cudaFree(cOutput);
+    if(err != cudaSuccess) {
+      cerr << "Failure freeing output" << endl;
+      exit(1);
+    }
+
+    free(hOutput);
   }
 } 
-
-/*
- * Helper function for CompareRead16. This function is passed into thread arguments
- */
-void read_compare_func16(string header, string read_line, string chrom_name, vector<unsigned short> * ref, int shift, int threshold, int seed) {
-  int j = 0;
-  // Save read sequence
-  //header += read_line + '\n';
-
-  //cout << "Converting string" << endl;
-  std::vector<unsigned short> readv_temp, read_inverse_temp;
-  unsigned short * readv, * read_inverse;
-  readv = (unsigned short *)malloc((read_line.size()-1)*sizeof(short));
-  read_inverse = (unsigned short *)malloc((read_line.size()-1)*sizeof(short));
-  int read_size = read_line.size();
-  for(; j < read_size-1; j++) {
-    readv_temp.push_back(ConvertCharacters16(read_line[j], read_line[j+1]));
-    read_inverse_temp.push_back(ConvertInverseCharacters16(read_line[read_size-(j+1)], read_line[read_size-(j+2)]));
-  }
-
-  //cout << "Doing shift" << endl;
-  for(int i = 0; i < readv_temp.size(); i++){
-    unsigned short a = readv_temp.at(i);
-    unsigned short b = read_inverse_temp.at(i);
-    for(j = 0; j <= shift; j++){
-      if(i>=j){
-	a = a | readv_temp.at(i-j);
-	b = b | read_inverse_temp.at(i-j);
-      }
-      if((i+j)<readv_temp.size()){
-	a = a | readv_temp.at(i+j);
-	b = b | read_inverse_temp.at(i+j);
-      }
-    }
-    readv[i] = a;
-    read_inverse[i] = b;
-  }
-
-  //cout << "Starting cuda memory allocation" << endl;
-
-  //int blockD = 1024 << 5;
-
-  int numElements=ref->size();//blockD*32*32;//ref->size();
-  //cout << "Number of Elements: " << numElements << " Total: " << ref->size() << endl;
-  size_t size = numElements*sizeof(short);
-  size_t size_out = numElements*sizeof(char);
-  size_t size_read = (read_size-1)*sizeof(short);
-  char* hOutput = (char*)malloc(size_out);
-
-  cudaError_t err = cudaSuccess;
-  unsigned short *cRef = NULL;
-  err = cudaMalloc((void **) &cRef, size);
-  if(err != cudaSuccess){
-    cerr << "Failed to allocate device vector ref (error code " << cudaGetErrorString(err) << ")!" << endl;
-    exit(1);
-  }
-
-  unsigned short *cRead = NULL;
-  err = cudaMalloc((void **) &cRead, size_read);
-  if(err != cudaSuccess) {
-    cerr << "Cuda failure on cRead" << endl;
-    exit(1);
-  }
-
-  unsigned short *cInverse = NULL;
-  err = cudaMalloc((void **) &cInverse, size_read);
-  if(err != cudaSuccess) {
-    cerr << "Cuda failure on cInverse" << endl;
-    exit(1);
-  }
-
-  char* cOutput = NULL;
-  err = cudaMalloc((void **) &cOutput, size_out);
-  if(err != cudaSuccess) {
-    cerr << "CudaFailure on cOutput" << cudaGetErrorString(err) << endl;
-    exit(1);
-  }
-
-  err = cudaMemcpy(cRead, readv, size_read, cudaMemcpyHostToDevice);
-  if(err != cudaSuccess) {
-    cerr << "Cuda failure on copying cRead " << cudaGetErrorString(err) << endl;
-    exit(1);
-  }
-
-  err = cudaMemcpy(cInverse, read_inverse, size_read, cudaMemcpyHostToDevice);
-  if(err != cudaSuccess) {
-    cerr << "Cuda failure on copying cInverse " << cudaGetErrorString(err) << endl;
-    exit(1);
-  }
-
-  //cout << "Doing reference " << endl;
-
-  err = cudaMemcpy(cRef, (unsigned short*)(&(ref->at(0))), size, cudaMemcpyHostToDevice);
-  if(err != cudaSuccess) {
-    cerr << "Cuda Failure on copying cRef" << endl;
-    exit(1);
-  }
-
-  dim3 threadsPerBlock(seed, seed);
-  int blocksPerGrid= (numElements + seed)/(seed);
-
-  for(int i = 0; i < (read_size-1)/seed; i++){
-
-    //cout << "Starting cuda computation with " << threadsPerBlock.x << "x" << threadsPerBlock.y << "threads and " << blocksPerGrid << "blocks " << endl;
-
-    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cRead, cOutput, numElements, i*seed);
-    err = cudaGetLastError();
-    if(err != cudaSuccess){
-      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
-      exit(1);
-    }
-
-    //cout << "Starting cuda freeing memory" << endl;
-
-    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
-    if(err != cudaSuccess){
-      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
-      exit(1);
-    }
-
-    for(int ii = 0; ii < numElements; ii++)
-      if(hOutput[ii] >= seed-threshold)
-	cout << header << '\t' << seed << '\t' << i << '\t' << "0" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
-
-  }
-
-  for(int i = 0; i < (read_size-1)/seed; i++){
-
-    //cout << "Starting cuda computation with " << threadsPerBlock.x << "x" << threadsPerBlock.y << "threads and " << blocksPerGrid << "blocks " << endl;
-
-    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cInverse, cOutput, numElements, i*seed);
-    err = cudaGetLastError();
-    if(err != cudaSuccess){
-      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
-      exit(1);
-    }
-
-    //cout << "Starting cuda freeing memory" << endl;
-
-    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
-    if(err != cudaSuccess){
-      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
-      exit(1);
-    }
-
-    for(int ii = 0; ii < numElements; ii++)
-      if(hOutput[ii] >= seed-threshold)
-	cout << header << '\t' << seed << '\t' << i << '\t' << "16" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
-  }
-
-  err = cudaFree(cRef);
-  if(err != cudaSuccess) {
-    cerr << "Failure freeing reference" << endl;
-    exit(1);
-  }
-  err = cudaFree(cRead);
-  if(err != cudaSuccess) {
-    cerr << "Failure freeing read" << endl;
-    exit(1);
-  }
-  err = cudaFree(cInverse);
-  if(err != cudaSuccess) {
-    cerr << "failure freeing cinverse" << endl;
-    exit(1);
-  }
-  err = cudaFree(cOutput);
-  if(err != cudaSuccess) {
-    cerr << "Failure freeing output" << endl;
-    exit(1);
-  }
-
-  //cout << "Freed cuda memory" << endl;
-
-
-
-  free(hOutput);
-  free(readv);
-  free(read_inverse);
-  //cout << "Completed function" << endl;
-
-}
 
 /*
  * Compares each read in the read_file to the reference genome according o the shift and threshold
