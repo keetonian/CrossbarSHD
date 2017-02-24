@@ -36,57 +36,48 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
  * ref: pointer to reference genome (large compared to read). Format: 16-bit 1-hot encodings.
  * read: pointer to read sequence. Again, 16-bit 1-hot encodings.
  */
-__global__ void compare16(const unsigned short * ref, const unsigned short * read, const unsigned short * inverse, char * output, int numElements) {
+__global__ void compare16(const unsigned short * ref, const unsigned short * read, char * output, int numElements, int rIndex) {
 
   __shared__ short rd[1024];
-  __shared__ short inv[1024];
 
-  int i = threadIdx.x + threadIdx.y + blockIdx.x*blockDim.y;
+  int i = threadIdx.x + threadIdx.y + blockIdx.x*blockDim.x;
   int ii = threadIdx.x + threadIdx.y*blockDim.x;
 
   rd[ii] = 0;
-  inv[ii] = 0;
   if(i < numElements){
-    if(read[threadIdx.x]&ref[i])
+    if(read[threadIdx.x+rIndex]&ref[i])
       rd[ii] = 1;
-    if(inverse[threadIdx.x]&ref[i])
-      inv[ii] = 1;
   }
 
   __syncthreads();
 
   if(threadIdx.x % 2 == 0 && threadIdx.x + 1 < blockDim.x){
     rd[ii] += rd[ii+1];
-    inv[ii] += inv[ii+1];
   }
   __syncthreads();
   if(threadIdx.x % 4 == 0 && threadIdx.x + 2 < blockDim.x){
     rd[ii] += rd[ii+2];
-    inv[ii] += inv[ii+2];
   }
   __syncthreads();
   if(threadIdx.x % 8 == 0 && threadIdx.x + 4 < blockDim.x){
     rd[ii] += rd[ii+4];
-    inv[ii] += inv[ii+4];
   }
   __syncthreads();
   if(threadIdx.x % 16 == 0 && threadIdx.x + 8 < blockDim.x){
     rd[ii] += rd[ii+8];
-    inv[ii] += inv[ii+8];
   }
   __syncthreads();
   if(threadIdx.x % 32 == 0 && threadIdx.x + 16 < blockDim.x){
     rd[ii] += rd[ii+16];
-    inv[ii] += inv[ii+16];
   }
   __syncthreads();
 
   if(threadIdx.x == 0)
-    output[i] = rd[ii] > inv[ii] ? rd[ii] : inv[ii];
+    output[i] = rd[ii];
 }
 
 char* sequence = 0;
-int threads = 2;
+int seed_size = 32;
 
 int main(int argc, char** argv)
 {
@@ -102,8 +93,8 @@ int main(int argc, char** argv)
   int shift = 0;
   int encoding = 1;
   int threshold = 0;
-  
-  if(CommandLineOptions(argc, argv, &shift, &encoding, &threshold, &reference_file, &read_file, &sequence, &threads))
+
+  if(CommandLineOptions(argc, argv, &shift, &encoding, &threshold, &reference_file, &read_file, &sequence, &seed_size))
     exit(0);
 
   //cout<<"shift: "<< shift<<endl;
@@ -149,28 +140,28 @@ void CompareRead16(char* read_file, char* reference_file, int shift, int thresho
     // Step through the read sequences
     while(getline(file, read_line)) {
       if(read_line.size() > 2 && read_line[0] == '@' && read_line[1] == 'E' && read_line[2] == 'R') {
-        char c = read_line[1];
-        string name = "";
-        int cindex = 1;
-        while(c != ' ') {
-          name+=c;
-          cindex++;
-          c = read_line[cindex];
-        }
-        // s+='\t';
-        if(sequence != 0){
-          if(str == name)
-            sequence = 0;
-          else
-            continue;
-        }
+	char c = read_line[1];
+	string name = "";
+	int cindex = 1;
+	while(c != ' ') {
+	  name+=c;
+	  cindex++;
+	  c = read_line[cindex];
+	}
+	// s+='\t';
+	if(sequence != 0){
+	  if(str == name)
+	    sequence = 0;
+	  else
+	    continue;
+	}
 
 
-        getline(file, read_line);
-        for(unsigned int i = 0; i < ref.size(); i++){
-          //p.push(read_compare_func16, name, read_line, ref_names.at(i), ref.at(i), shift, threshold);
-	  read_compare_func16(name, read_line, ref_names.at(i), ref.at(i), shift, threshold, 32);
-        }
+	getline(file, read_line);
+	for(unsigned int i = 0; i < ref.size(); i++){
+	  //p.push(read_compare_func16, name, read_line, ref_names.at(i), ref.at(i), shift, threshold);
+	  read_compare_func16(name, read_line, ref_names.at(i), ref.at(i), shift, threshold, seed_size);
+	}
       }
     }
   }
@@ -216,7 +207,7 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
     readv[i] = a;
     read_inverse[i] = b;
   }
-  
+
   //cout << "Starting cuda memory allocation" << endl;
 
   //int blockD = 1024 << 5;
@@ -278,23 +269,55 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
   }
 
   dim3 threadsPerBlock(seed, seed);
-  int blocksPerGrid= numElements/(seed);
+  int blocksPerGrid= (numElements + seed)/(seed);
 
-  //cout << "Starting cuda computation with " << threadsPerBlock.x << "x" << threadsPerBlock.y << "threads and " << blocksPerGrid << "blocks " << endl;
+  for(int i = 0; i < (read_size-1)/seed; i++){
 
-  compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cRead, cInverse, cOutput, numElements);
-  err = cudaGetLastError();
-  if(err != cudaSuccess){
-    cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
-    exit(1);
+    //cout << "Starting cuda computation with " << threadsPerBlock.x << "x" << threadsPerBlock.y << "threads and " << blocksPerGrid << "blocks " << endl;
+
+    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cRead, cOutput, numElements, i*seed);
+    err = cudaGetLastError();
+    if(err != cudaSuccess){
+      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
+      exit(1);
+    }
+
+    //cout << "Starting cuda freeing memory" << endl;
+
+    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
+    if(err != cudaSuccess){
+      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
+      exit(1);
+    }
+
+    for(int ii = 0; ii < numElements; ii++)
+      if(hOutput[ii] >= seed-threshold)
+	cout << header << '\t' << seed << '\t' << i << '\t' << "0" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
+
   }
 
-  //cout << "Starting cuda freeing memory" << endl;
+  for(int i = 0; i < (read_size-1)/seed; i++){
 
-  err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
-  if(err != cudaSuccess){
-    cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
-    exit(1);
+    //cout << "Starting cuda computation with " << threadsPerBlock.x << "x" << threadsPerBlock.y << "threads and " << blocksPerGrid << "blocks " << endl;
+
+    compare16<<<blocksPerGrid,threadsPerBlock>>>(cRef, cInverse, cOutput, numElements, i*seed);
+    err = cudaGetLastError();
+    if(err != cudaSuccess){
+      cout << "Failure on cuda computation: " << cudaGetErrorString(err) << endl;
+      exit(1);
+    }
+
+    //cout << "Starting cuda freeing memory" << endl;
+
+    err = cudaMemcpy(hOutput, cOutput, size_out, cudaMemcpyDeviceToHost);
+    if(err != cudaSuccess){
+      cerr << "Failure on copying output" << cudaGetErrorString(err) << endl;
+      exit(1);
+    }
+
+    for(int ii = 0; ii < numElements; ii++)
+      if(hOutput[ii] >= seed-threshold)
+	cout << header << '\t' << seed << '\t' << i << '\t' << "16" << '\t' << chrom_name << '\t' << ii << '\t' << (int)hOutput[ii] << endl;
   }
 
   err = cudaFree(cRef);
@@ -320,9 +343,6 @@ void read_compare_func16(string header, string read_line, string chrom_name, vec
 
   //cout << "Freed cuda memory" << endl;
 
-  for(int ii = 0; ii < numElements; ii++)
-    if(hOutput[ii] >= seed-threshold)
-      cout << header << '\t' << chrom_name << '\t' << "index: " << ii << " score: " << (int)hOutput[ii] << endl;
 
 
   free(hOutput);
@@ -352,20 +372,20 @@ void CompareRead4(char* read_file, char* reference_file, int shift, int threshol
     // Step through the read sequences
     while(getline(file, read_line)) {
       if(read_line.size() > 2 && read_line[0] == '@' && read_line[1] == 'E' && read_line[2] == 'R') {
-        char c = read_line[1];
-        string s = "";
-        int cindex = 1;
-        while(c != ' ') {
-          s+=c;
-          cindex++;
-          c = read_line[cindex];
-        }
-        //s+='\t';
+	char c = read_line[1];
+	string s = "";
+	int cindex = 1;
+	while(c != ' ') {
+	  s+=c;
+	  cindex++;
+	  c = read_line[cindex];
+	}
+	//s+='\t';
 
-        getline(file, read_line);
-        for(unsigned int i = 0; i < ref.size(); i++) {
-    //      p.push(read_compare_func4, s, read_line, ref_names.at(i), ref.at(i), shift, threshold);
-        }
+	getline(file, read_line);
+	for(unsigned int i = 0; i < ref.size(); i++) {
+	  //      p.push(read_compare_func4, s, read_line, ref_names.at(i), ref.at(i), shift, threshold);
+	}
       }
     }
   }
@@ -395,9 +415,9 @@ void read_compare_func4(int id, string header, string read_line, string chrom_na
   string res = compare4(ref, readv, read_inverse, shift, threshold, &num_matches, header, chrom_name);
 
   if(res.size() > 1) {
-  //if(report_total_matches)
+    //if(report_total_matches)
     //cout<<res<<"TOTAL MATCHES: " << num_matches << '\n' << endl;
-  //else
+    //else
     cout<<res.substr(0, res.size() - 1)<<endl;
   }
 }

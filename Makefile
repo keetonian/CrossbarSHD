@@ -5,7 +5,7 @@ CFLAGS = -std=c++11 -O2
 all: CrossbarSHD cxcompare
 
 CrossbarSHD: crossbar_shd.cu compare.o reference.o commandline.o
-	$(NVCC) $(CFLAGS) -arch=sm_30 -o CrossbarSHD crossbar_shd.cu compare.o reference.o commandline.o 
+	$(NVCC) -std=c++11 -arch=sm_30 -o CrossbarSHD crossbar_shd.cu compare.o reference.o commandline.o 
 
 compare.o: compare.h compare.cpp
 	$(CXX) $(CFLAGS) -c compare.cpp 
